@@ -25,10 +25,18 @@ This is useful for:
 
 ## Quick start
 
-### 1. Build the image
+### 1. Get the image
+
+Pull the pre-built image from Docker Hub (supports both amd64 and arm64/Apple Silicon):
 
 ```bash
-docker build -f Containerfile -t mitm-ai-observability .
+docker pull hisu/mitm-ai-observability:latest
+```
+
+Or build it yourself:
+
+```bash
+docker build -f Containerfile -t hisu/mitm-ai-observability .
 ```
 
 ### 2. Run
@@ -46,7 +54,7 @@ ANTHROPIC_API_KEY=sk-ant-... ./run.sh
 This starts the container with:
 - mitmweb proxy running in the background (port 8080)
 - mitmweb UI accessible from the host at the URL printed on startup (port 8081)
-- your `~/sources` directory mounted at `/workspace`
+- your home directory mounted at `/workspace`
 - your Claude Code config (`~/.claude` and `~/.claude.json`) mounted for authentication and settings
 
 ### 3. Use Claude Code

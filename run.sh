@@ -7,7 +7,7 @@
 # Or pass the key inline:
 #   ./run.sh -e ANTHROPIC_API_KEY=sk-...
 
-IMAGE_NAME="mitm-ai-observability"
+IMAGE_NAME="hisu/mitm-ai-observability"
 
 docker run -it --rm \
     ${ANTHROPIC_API_KEY:+-e ANTHROPIC_API_KEY} \
