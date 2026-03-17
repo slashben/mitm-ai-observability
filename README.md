@@ -1,6 +1,10 @@
 # MITM Claude Code observability
 
+> 🔍 **Do you know what your Claude Code is doing?** Would you like to see how your Agents are interacting with the world? **You are at the right place.**
+
 A containerized environment for intercepting and inspecting all TLS traffic between Claude Code and Anthropic's API using [mitmproxy](https://mitmproxy.org/). Run Claude Code inside the container and observe every API call — prompts, responses, token usage, tool calls — in real time through mitmweb's browser UI.
+
+![mitmweb UI showing intercepted AI traffic](docs/full-view.png)
 
 ## Why
 
@@ -25,31 +29,18 @@ This is useful for:
 
 ## Quick start
 
-### 1. Get the image
-
-Pull the pre-built image from Docker Hub (supports both amd64 and arm64/Apple Silicon):
+Run the pre-built image directly (supports both amd64 and arm64/Apple Silicon):
 
 ```bash
-docker pull hisu/mitm-ai-observability:latest
+docker run -it --rm \
+    -p 8081:8081 \
+    -v "$HOME":/workspace:z \
+    -v "$HOME/.claude":/root/.claude:z \
+    -v "$HOME/.claude.json":/root/.claude.json:z \
+    hisu/mitm-ai-observability
 ```
 
-Or build it yourself:
-
-```bash
-docker build -f Containerfile -t hisu/mitm-ai-observability .
-```
-
-### 2. Run
-
-```bash
-./run.sh
-```
-
-Your existing Claude Code authentication (`~/.claude/.credentials.json`) is mounted into the container, so no API key is needed. If you prefer using an API key instead, pass it as an environment variable:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-... ./run.sh
-```
+Your existing Claude Code authentication (`~/.claude/.credentials.json`) is mounted into the container, so no API key is needed. If you prefer using an API key instead, pass `-e ANTHROPIC_API_KEY=sk-ant-...` before the image name.
 
 This starts the container with:
 - mitmweb proxy running in the background (port 8080)
@@ -57,7 +48,15 @@ This starts the container with:
 - your home directory mounted at `/workspace`
 - your Claude Code config (`~/.claude` and `~/.claude.json`) mounted for authentication and settings
 
-### 3. Use Claude Code
+### Building from source
+
+```bash
+docker build -f Containerfile -t hisu/mitm-ai-observability .
+```
+
+A convenience script `run.sh` is included if you clone the repo.
+
+### Use Claude Code
 
 Inside the container shell:
 
