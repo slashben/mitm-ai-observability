@@ -13,7 +13,9 @@ RUN pip install --no-cache-dir mitmproxy anthropic
 RUN npm install -g @anthropic-ai/claude-code
 
 # Generate mitmproxy CA certificate and install it into the system trust store
-RUN timeout 2 mitmdump || true \
+# mitmdump needs extra time on emulated architectures (e.g. arm64 via QEMU)
+RUN mitmdump &>/dev/null & \
+    for i in $(seq 120); do test -f /root/.mitmproxy/mitmproxy-ca-cert.pem && break || sleep 1; done \
     && cp /root/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy.crt \
     && update-ca-certificates
 
