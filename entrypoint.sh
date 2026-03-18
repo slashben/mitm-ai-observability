@@ -34,4 +34,23 @@ echo "mitmweb running (pid $MITM_PID)"
 echo "Web UI: ${WEB_URL:-http://localhost:${MITMWEB_PORT}}"
 echo ""
 
+# Start OpenClaw gateway if config is present (foreground mode — systemd unavailable in containers)
+if [ -f /root/.openclaw/openclaw.json ] || [ -n "$OPENCLAW_GATEWAY_TOKEN" ]; then
+    echo "Starting OpenClaw gateway (foreground)..."
+    openclaw gateway run > /var/log/openclaw-gateway.log 2>&1 &
+    CLAW_PID=$!
+    sleep 3
+    if kill -0 "$CLAW_PID" 2>/dev/null; then
+        echo "OpenClaw gateway running (pid $CLAW_PID) — log: /var/log/openclaw-gateway.log"
+    else
+        echo "WARNING: OpenClaw gateway failed to start:"
+        tail -5 /var/log/openclaw-gateway.log 2>/dev/null
+        echo "(full log: /var/log/openclaw-gateway.log)"
+    fi
+    echo ""
+else
+    echo "No OpenClaw config found — skipping gateway (mount ~/.openclaw to enable)"
+    echo ""
+fi
+
 exec bash

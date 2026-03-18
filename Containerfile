@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir mitmproxy anthropic
 
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code openclaw@latest
 
 # Generate mitmproxy CA certificate and install it into the system trust store
 # mitmdump needs extra time on emulated architectures (e.g. arm64 via QEMU)
@@ -21,7 +21,9 @@ RUN mitmdump &>/dev/null & \
 
 ENV HTTP_PROXY=http://127.0.0.1:8080 \
     HTTPS_PROXY=http://127.0.0.1:8080 \
-    NODE_EXTRA_CA_CERTS=/root/.mitmproxy/mitmproxy-ca-cert.pem
+    NO_PROXY=127.0.0.1,localhost \
+    NODE_EXTRA_CA_CERTS=/root/.mitmproxy/mitmproxy-ca-cert.pem \
+    NODE_OPTIONS="--experimental-global-navigator"
 
 EXPOSE 8080 8081
 

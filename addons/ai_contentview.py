@@ -5,7 +5,9 @@ Prettifies request and response bodies for:
 - Anthropic Messages API (streaming SSE and non-streaming JSON)
 - MCP Protocol (JSON-RPC 2.0 over HTTP via mcp-proxy.anthropic.com)
 - OpenAI Chat Completions API (and compatible providers)
+- OpenResponses API (/v1/responses — used by OpenClaw and compatible gateways)
 - Google Gemini API (stub)
+- Cursor IDE API traffic (api2.cursor.sh, api.cursor.com)
 - Claude Code telemetry/event logging
 """
 
@@ -42,6 +44,10 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "gpt-4.1-nano": {"input": 0.1, "output": 0.4},
     "o3": {"input": 2.0, "output": 8.0},
     "o4-mini": {"input": 1.1, "output": 4.4},
+    "deepseek-chat": {"input": 0.27, "output": 1.10},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.0},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.60},
 }
 
 AI_HOSTS = {
@@ -49,6 +55,9 @@ AI_HOSTS = {
     "mcp-proxy.anthropic.com",
     "api.openai.com",
     "generativelanguage.googleapis.com",
+    "openrouter.ai",
+    "api2.cursor.sh",
+    "api.cursor.com",
 }
 
 AI_PATH_PREFIXES = (
@@ -57,6 +66,7 @@ AI_PATH_PREFIXES = (
     "/api/event_logging/",
     "/v1/chat/completions",
     "/v1beta/models/",
+    "/v1/responses",
 )
 
 MAX_TEXT = 300
@@ -750,6 +760,216 @@ def _format_gemini_response(body: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenResponses API (/v1/responses — OpenClaw, OpenRouter, compatible gateways)
+# ---------------------------------------------------------------------------
+
+def _format_openresponses_request(body: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append(f"model: {body.get('model', '?')}")
+    if body.get("stream"):
+        lines.append(f"stream: {body['stream']}")
+    if temp := body.get("temperature"):
+        lines.append(f"temperature: {temp}")
+    if mt := body.get("max_output_tokens"):
+        lines.append(f"max_output_tokens: {mt}")
+    if reasoning := body.get("reasoning"):
+        lines.append(f"reasoning: {json.dumps(reasoning)}")
+    if instructions := body.get("instructions"):
+        lines.append(f"instructions: {_trunc(instructions, MAX_SYSTEM)}")
+    if prev := body.get("previous_response_id"):
+        lines.append(f"previous_response_id: {_trunc(prev, 60)}")
+
+    tools = body.get("tools", [])
+    if tools:
+        lines.append("")
+        lines.append(f"tools: ({len(tools)} defined)")
+        for t in tools:
+            name = t.get("name", "?")
+            lines.append(f"  - {name}")
+
+    inp = body.get("input")
+    if isinstance(inp, str):
+        lines.append("")
+        lines.append(f"input: {_trunc(inp)}")
+    elif isinstance(inp, list):
+        lines.append("")
+        lines.append(f"input: ({len(inp)} items)")
+        for item in inp:
+            if not isinstance(item, dict):
+                lines.append(f"  - {_trunc(str(item))}")
+                continue
+            itype = item.get("type", "?")
+            role = item.get("role", "")
+            label = f"{role}/{itype}" if role else itype
+            if itype in ("message", "user_message", "system_message", "developer_message",
+                         "assistant_message"):
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    lines.append(f"  [{label}] {_trunc(content)}")
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "input_text":
+                            lines.append(f"  [{label}/text] {_trunc(part.get('text', ''))}")
+                        else:
+                            lines.append(f"  [{label}] {_trunc(str(part), 150)}")
+            elif itype == "function_call":
+                lines.append(f"  [{label}] {item.get('name', '?')}({_trunc(item.get('arguments', ''), 100)})")
+            elif itype == "function_call_output":
+                lines.append(f"  [{label}] id={_trunc(item.get('call_id', '?'), 30)} -> {_trunc(str(item.get('output', '')), 100)}")
+            elif itype == "reasoning":
+                lines.append(f"  [{label}] (reasoning item)")
+            elif itype == "item_reference":
+                lines.append(f"  [{label}] ref={item.get('id', '?')}")
+            else:
+                lines.append(f"  [{label}] {_trunc(str(item), 150)}")
+
+    return "\n".join(lines)
+
+
+def _format_openresponses_sse(text: str) -> str:
+    clean = _strip_chunked_encoding(text)
+    lines_out: list[str] = []
+    model = ""
+    resp_id = ""
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, str]] = []
+    current_tool: dict[str, str] | None = None
+    status = ""
+    usage: dict[str, Any] = {}
+
+    for line in clean.split("\n"):
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            evt = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        etype = evt.get("type", "")
+
+        if etype == "response.created":
+            resp = evt.get("response", {})
+            model = resp.get("model", "")
+            resp_id = resp.get("id", "")
+
+        elif etype == "response.output_item.added":
+            item = evt.get("item", {})
+            if item.get("type") == "function_call":
+                current_tool = {"name": item.get("name", "?"), "call_id": item.get("call_id", ""), "arguments": ""}
+
+        elif etype == "response.output_text.delta":
+            text_parts.append(evt.get("delta", ""))
+
+        elif etype == "response.function_call_arguments.delta":
+            if current_tool is not None:
+                current_tool["arguments"] += evt.get("delta", "")
+
+        elif etype == "response.function_call_arguments.done":
+            if current_tool is not None:
+                args = current_tool["arguments"]
+                try:
+                    args = json.dumps(json.loads(args), indent=2)
+                except json.JSONDecodeError:
+                    pass
+                tool_calls.append({"name": current_tool["name"], "call_id": current_tool["call_id"], "arguments": args})
+                current_tool = None
+
+        elif etype == "response.completed":
+            resp = evt.get("response", {})
+            status = resp.get("status", "")
+            usage = resp.get("usage", {})
+            if not model:
+                model = resp.get("model", "")
+
+    if model:
+        lines_out.append(f"model: {model}")
+    if resp_id:
+        lines_out.append(f"response_id: {resp_id}")
+    if status:
+        lines_out.append(f"status: {status}")
+
+    if usage:
+        lines_out.append("")
+        lines_out.append("usage:")
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            if k in usage:
+                lines_out.append(f"  {k}: {usage[k]}")
+        if model:
+            cost = _estimate_cost(model, usage)
+            if cost:
+                lines_out.append(f"  estimated_cost: {cost}")
+
+    if tool_calls:
+        lines_out.append("")
+        lines_out.append(f"tool_calls: ({len(tool_calls)})")
+        for tc in tool_calls:
+            lines_out.append(f"  - {tc['name']} (call_id: {_trunc(tc['call_id'], 30)})")
+            lines_out.append(_indent(tc["arguments"], "    "))
+
+    full_text = "".join(text_parts)
+    if full_text:
+        lines_out.append("")
+        lines_out.append("output_text:")
+        lines_out.append(_indent(_trunc(full_text, 2000)))
+
+    return "\n".join(lines_out) if lines_out else text
+
+
+def _format_openresponses_json_response(body: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append(f"model: {body.get('model', '?')}")
+    lines.append(f"response_id: {body.get('id', '?')}")
+    lines.append(f"status: {body.get('status', '?')}")
+
+    usage = body.get("usage", {})
+    if usage:
+        lines.append("")
+        lines.append("usage:")
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            if k in usage:
+                lines.append(f"  {k}: {usage[k]}")
+        model = body.get("model", "")
+        if model:
+            cost = _estimate_cost(model, usage)
+            if cost:
+                lines.append(f"  estimated_cost: {cost}")
+
+    output = body.get("output", [])
+    if output:
+        lines.append("")
+        lines.append(f"output: ({len(output)} items)")
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type", "?")
+            if itype == "message":
+                role = item.get("role", "?")
+                for part in item.get("content", []):
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        lines.append(f"  [{role}/text] {_trunc(part.get('text', ''), 2000)}")
+                    elif isinstance(part, dict):
+                        lines.append(f"  [{role}/{part.get('type', '?')}] ...")
+            elif itype == "function_call":
+                args = item.get("arguments", "")
+                try:
+                    args = json.dumps(json.loads(args), indent=2)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                lines.append(f"  [function_call] {item.get('name', '?')} (call_id: {_trunc(item.get('call_id', '?'), 30)})")
+                lines.append(_indent(args, "    "))
+            elif itype == "reasoning":
+                lines.append(f"  [reasoning] (reasoning item)")
+            else:
+                lines.append(f"  [{itype}] {_trunc(str(item), 150)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Traffic type detection
 # ---------------------------------------------------------------------------
 
@@ -772,6 +992,8 @@ def _get_flow_info(metadata: contentviews.Metadata) -> tuple[str, str, bool]:
 
 def _is_ai_traffic(host: str, path: str) -> bool:
     if host in AI_HOSTS:
+        return True
+    if "cursor.sh" in host or "cursorapi.com" in host or "cursor.com" in host:
         return True
     for prefix in AI_PATH_PREFIXES:
         if path.startswith(prefix):
@@ -859,6 +1081,42 @@ class AITrafficView(contentviews.Contentview):
                 return _format_gemini_request(body)
             else:
                 return _format_gemini_response(body)
+
+        # --- OpenResponses API (OpenClaw, OpenRouter, compatible gateways) ---
+        if "/v1/responses" in path:
+            if is_request:
+                try:
+                    body = json.loads(text)
+                    return _format_openresponses_request(body)
+                except json.JSONDecodeError:
+                    return text
+            elif "event-stream" in ct:
+                return _format_openresponses_sse(text)
+            else:
+                clean = _strip_chunked_encoding(text)
+                try:
+                    body = json.loads(clean)
+                    return _format_openresponses_json_response(body)
+                except json.JSONDecodeError:
+                    return text
+
+        # --- Cursor IDE (OpenAI-compatible backend) ---
+        if "cursor.sh" in host or "cursorapi.com" in host or "cursor.com" in host:
+            if is_request:
+                try:
+                    body = json.loads(text)
+                    return _format_openai_request(body)
+                except json.JSONDecodeError:
+                    return text
+            elif "event-stream" in ct:
+                return _format_openai_sse(text)
+            else:
+                clean = _strip_chunked_encoding(text)
+                try:
+                    body = json.loads(clean)
+                    return _format_openai_json_response(body)
+                except json.JSONDecodeError:
+                    return text
 
         return text
 
@@ -1181,6 +1439,31 @@ class AITrafficMarker:
             flow.marked = ":robot:"
             flow.comment = "Gemini request"
 
+        elif "/v1/responses" in path:
+            flow.marked = ":robot:"
+            try:
+                body = json.loads(flow.request.get_text())
+                model = body.get("model", "?")
+                inp = body.get("input")
+                n_items = len(inp) if isinstance(inp, list) else (1 if inp else 0)
+                n_tools = len(body.get("tools", []))
+                parts = [f"OpenClaw | {model} | {n_items} input items"]
+                if n_tools:
+                    parts.append(f"{n_tools} tools")
+                flow.comment = " | ".join(parts)
+            except (json.JSONDecodeError, ValueError):
+                flow.comment = "OpenClaw request"
+
+        elif "cursor.sh" in host or "cursorapi.com" in host or "cursor.com" in host:
+            flow.marked = ":robot:"
+            try:
+                body = json.loads(flow.request.get_text())
+                model = body.get("model", "?")
+                n_msgs = len(body.get("messages", []))
+                flow.comment = f"Cursor | {model} | {n_msgs} msgs"
+            except (json.JSONDecodeError, ValueError):
+                flow.comment = "Cursor request"
+
     def response(self, flow: http.HTTPFlow) -> None:
         if not flow.response:
             return
@@ -1238,6 +1521,27 @@ class AITrafficMarker:
             except (json.JSONDecodeError, ValueError):
                 pass
 
+        elif "/v1/responses" in path:
+            try:
+                usage = {}
+                model_hint = ""
+                if "event-stream" in ct:
+                    usage = self._extract_openresponses_sse_usage(flow.response.get_text())
+                else:
+                    text = _strip_chunked_encoding(flow.response.get_text())
+                    body = json.loads(text)
+                    usage = body.get("usage", {})
+                    model_hint = body.get("model", "")
+                if usage:
+                    tok = self._format_token_summary(usage)
+                    cost = _estimate_cost(model_hint or (existing.split("|")[1].strip() if "|" in existing else ""), usage)
+                    parts = [existing, tok]
+                    if cost:
+                        parts.append(cost)
+                    flow.comment = " | ".join(p for p in parts if p)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
     @staticmethod
     def _extract_sse_usage(text: str) -> dict[str, Any]:
         clean = _strip_chunked_encoding(text)
@@ -1254,6 +1558,22 @@ class AITrafficMarker:
                 usage = evt.get("message", {}).get("usage", {})
             elif evt.get("type") == "message_delta" and evt.get("usage"):
                 usage = {**usage, **{k: v for k, v in evt["usage"].items() if v}}
+        return usage
+
+    @staticmethod
+    def _extract_openresponses_sse_usage(text: str) -> dict[str, Any]:
+        clean = _strip_chunked_encoding(text)
+        usage: dict[str, Any] = {}
+        for line in clean.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            try:
+                evt = json.loads(line[6:].strip())
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") == "response.completed":
+                usage = evt.get("response", {}).get("usage", {})
         return usage
 
     @staticmethod
